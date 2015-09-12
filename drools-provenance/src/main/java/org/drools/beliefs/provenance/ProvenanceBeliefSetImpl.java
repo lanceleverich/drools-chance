@@ -7,14 +7,15 @@ import org.drools.beliefs.provenance.templates.TemplateRegistry;
 import org.drools.core.InitialFact;
 import org.drools.core.beliefsystem.BeliefSystem;
 import org.drools.core.beliefsystem.simple.SimpleBeliefSet;
-import org.drools.core.beliefsystem.simple.SimpleMode;
 import org.drools.core.common.InternalFactHandle;
 import org.drools.core.definitions.rule.impl.RuleImpl;
 import org.drools.core.factmodel.AnnotationDefinition;
 import org.drools.core.metadata.*;
-import org.drools.core.process.core.Work;
+import org.drools.core.reteoo.LeftTuple;
+import org.drools.core.rule.Collect;
 import org.drools.core.rule.Declaration;
 import org.drools.core.rule.Pattern;
+import org.drools.core.rule.PatternSource;
 import org.drools.core.rule.RuleConditionElement;
 import org.drools.core.spi.Activation;
 import org.drools.core.util.Drools;
@@ -25,6 +26,7 @@ import org.mvel2.templates.TemplateRuntime;
 import org.w3.ns.prov.Activity;
 import org.w3.ns.prov.ActivityImpl;
 
+import java.net.URI;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -35,15 +37,15 @@ public class ProvenanceBeliefSetImpl
     private Map<String,Activity> provenance = new ConcurrentHashMap<String, Activity>();
 
     private static RuleEngine DROOLS_ENGINE = new org.jboss.drools.provenance.RuleEngineImpl()
-                                                .withIdentifier( new Literal( "JBoss Drools " + Drools.getFullVersion() ) );
+            .withIdentifier( new Literal( "JBoss Drools " + Drools.getFullVersion() ) );
 
     public ProvenanceBeliefSetImpl( BeliefSystem beliefSystem, InternalFactHandle rootHandle ) {
-        super( beliefSystem, rootHandle );
+        super(beliefSystem, rootHandle);
     }
 
 
     public void recordActivity( MetaCallableTask task, Activation activation, boolean positiveAssertion ) {
-    	Activity activity = this.createActivity( task, activation, positiveAssertion );
+        Activity activity = this.createActivity(task, activation, positiveAssertion);
         if ( activity == null ) {
             // no activity was actually performed
             return;
@@ -90,7 +92,7 @@ public class ProvenanceBeliefSetImpl
     }
 
     protected Activity toActivity( WorkingMemoryTask task, Activation justifier, boolean positiveAssertion ) {
-    	Activity activity = null;
+        Activity activity = null;
 
         Instance subject = getTarget( task );
         switch ( task.kind() ) {
@@ -142,27 +144,81 @@ public class ProvenanceBeliefSetImpl
                 map.put(declaration, justifier.getDeclarationValue(declaration));
             }
         }
+
+        // TODO this may need to be recursively invoked due to nestable conditional elements
+        LeftTuple tuple = justifier.getTuple();
+        List<RuleConditionElement> ces = justifier.getRule().getLhs().getChildren();
+        Collections.reverse( ces );
+        for ( RuleConditionElement element : ces ) {
+            if( element instanceof Pattern && ((Pattern) element).getSource() != null ) {
+                PatternSource ps = ( (Pattern) element ).getSource();
+                if ( ps instanceof Collect ) {
+                    Collect collect = (Collect) ps;
+                    List<?> facts = (List) tuple.getHandle().getObject();
+                    for ( Declaration dec : collect.getInnerDeclarations().values() ) {
+                        List<Object> vals = new ArrayList<Object>( facts.size() );
+                        for ( Object o : facts ) {
+                            vals.add( dec.getValue( ((ProvenanceBeliefSystem)this.getBeliefSystem()).getEp().getInternalWorkingMemory(), o ) );
+                        }
+                        map.put( dec.getBindingName(), vals );
+                    }
+                }
+            }
+            tuple = tuple.getParent();
+        }
+
         return TemplateRegistry.sanitize( map );
     }
 
     private void applyDecorations( Instance subject, Activity activity, Activation justifier, Map<String,Object> context ) {
+        List<RuleConditionElement> ruleElements = new ArrayList( justifier.getRule().getLhs().getChildren() );
+        Collections.reverse( ruleElements );
+
         for ( int j = 0; j < justifier.getObjects().size(); j++ ) {
             Object o = justifier.getObjects().get( j );
             if ( o instanceof InitialFact ) {
                 continue;
             }
 
-            if ( isEvidence( justifier.getRule().getLhs().getChildren().get( j ) ) ) {
-                Instance source = new InstanceImpl().withIdentifier( new Literal( MetadataContainer.getIdentifier( o ) ) );
 
-                subject.addWasDerivedFrom( source );
-                activity.addUsed( source );
+            RuleConditionElement element = ruleElements.get( j );
+            if(element instanceof Pattern && ((Pattern) element).getSource() != null) {
+                for(RuleConditionElement nestedElement : ((Pattern) element).getSource().getNestedElements()) {
+                    if (isEvidence( nestedElement )) {
 
-                decorateEvidence( source, justifier.getRule(), justifier.getRule().getLhs().getChildren().get( j ), context );
+                        int k = 0;
+                        for (Object listObj : (List) o) {
+                            Instance source = new InstanceImpl().withIdentifier(new Literal(MetadataContainer.getIdentifier(listObj)));
+
+                            subject.addWasDerivedFrom(source);
+                            activity.addUsed(source);
+
+                            decorateEvidence(source, justifier.getRule(), nestedElement, adjustContext( context, nestedElement.getInnerDeclarations(), k++ ) );
+                        }
+                    }
+                }
+            } else {
+                if (isEvidence( element )) {
+                    Instance source = new InstanceImpl().withIdentifier(new Literal(MetadataContainer.getIdentifier(o)));
+
+                    subject.addWasDerivedFrom(source);
+                    activity.addUsed(source);
+
+                    decorateEvidence(source, justifier.getRule(), element, context);
+                }
             }
         }
 
         decorateActivity( activity, subject, justifier, context );
+    }
+
+    private Map<String,Object> adjustContext( Map<String,Object> context, Map<String,Declaration> innerDeclarations, int idx ) {
+        Map<String, Object> clonedContext = new HashMap<String,Object>( context );
+        for ( String key : innerDeclarations.keySet() ) {
+            key = TemplateRegistry.sanitize( key );
+            clonedContext.put( key, ((List) context.get( key )).get( idx ) );
+        }
+        return clonedContext;
     }
 
     private void decorateActivity( Activity activity, Instance subject, Activation justifier, Map<String, Object> context ) {
@@ -181,7 +237,7 @@ public class ProvenanceBeliefSetImpl
 
         if ( templateRef != null || inlineTemplate != null ) {
             CompiledTemplate compiled = TemplateRegistry.getInstance().compileAndCache( (inlineTemplate != null && inlineTemplate.length() > 0) ?
-                                                                                                justifier.getRule().getName() : templateRef,
+                                                                                        justifier.getRule().getName() : templateRef,
                                                                                         inlineTemplate );
 
             String mainText = (String) TemplateRuntime.execute( compiled, context );
@@ -214,7 +270,8 @@ public class ProvenanceBeliefSetImpl
                                                                                             inlineTemplate );
 
                 try {
-                    String text = (String) TemplateRuntime.execute( compiled, context );
+                    Object comp = TemplateRuntime.execute(compiled, context);
+                    String text = comp.toString();
                     text = text.trim();
 
                     Narrative narr = new NarrativeImpl();
@@ -243,16 +300,16 @@ public class ProvenanceBeliefSetImpl
     private Activity newDerogation( WorkingMemoryTask task, Instance subject, Activation rule ) {
         Shed shed = (Shed) task;
         Activity activity = new DerogationImpl()
-                                        .withInvalidated( new TypificationImpl()
-                                                                    .withHadPrimarySource( subject )
-                                                                    .withValue( new Literal( getClassIdentifier( shed.getTrait() ) ) ) );
+                .withInvalidated( new TypificationImpl()
+                                          .withHadPrimarySource( subject )
+                                          .withValue( new Literal( getClassIdentifier( shed.getTrait() ) ) ) );
         addCommonInfo( activity, task, rule );
         return activity;
     }
 
     private Activity newRetraction( WorkingMemoryTask task, Instance subject, Activation rule ) {
         Activity activity = new RetractionImpl()
-                                        .withInvalidated( subject );
+                .withInvalidated( subject );
         addCommonInfo( activity, task, rule );
         return activity;
     }
@@ -265,7 +322,7 @@ public class ProvenanceBeliefSetImpl
         Activity last = null;
         while ( setter != null ) {
             Property prop = new PropertyImpl().withHadPrimarySource( subject )
-                                              .withIdentifier( new Literal( setter.getProperty().getKey().toString() ) );
+                    .withIdentifier( new Literal( setter.getProperty().getKey().toString() ) );
 
             if ( setter.getProperty().isManyValued() ) {
                 for ( Object o : (Collection) setter.getValue() ) {
@@ -313,10 +370,10 @@ public class ProvenanceBeliefSetImpl
     private Activity newDon( WorkingMemoryTask task, Instance subject, Activation rule ) {
         Don don = (Don) task;
         Activity activity = new RecognitionImpl()
-                                        .withGenerated( new TypificationImpl()
-                                                                .withHadPrimarySource( subject )
-                                                                .withIdentifier( new Literal( don.getUri().toString() ) )
-                                                                .withValue( new Literal( getClassIdentifier( don.getTrait() ) ) ) );
+                .withGenerated( new TypificationImpl()
+                                        .withHadPrimarySource( subject )
+                                        .withIdentifier( new Literal( don.getUri().toString() ) )
+                                        .withValue( new Literal( getClassIdentifier( don.getTrait() ) ) ) );
         addCommonInfo( activity, task, rule );
         return activity;
     }
@@ -324,7 +381,7 @@ public class ProvenanceBeliefSetImpl
     private Activity newAssert( WorkingMemoryTask task, Instance subject, Activation rule ) {
         NewInstance newInstance = (NewInstance) task;
         Activity activity = new AssertionImpl()
-                                        .withGenerated( subject );
+                .withGenerated( subject );
         addCommonInfo( activity, task, rule );
 
         Activity tip = activity;
@@ -347,7 +404,7 @@ public class ProvenanceBeliefSetImpl
     }
 
 
-	public Map<String,Activity> getProvenance() {
+    public Map<String,Activity> getProvenance() {
         return provenance;
     }
 
@@ -357,7 +414,7 @@ public class ProvenanceBeliefSetImpl
 
     private Instance getTarget( WorkingMemoryTask task ) {
         return new InstanceImpl()
-                        .withIdentifier( new Literal( task.getTargetId() ) );
+                .withIdentifier( new Literal( task.getTargetId() ) );
     }
 
     private Object getClassIdentifier( Class trait ) {

@@ -789,6 +789,37 @@ public class ProvenanceTest {
     }
 
     @Test
+    public void testProvenanceCollectionEvidence() {
+        KieSession kieSession = loadProvenanceSession("testProvenanceCollection.drl", null );
+
+        MyKlass mk = new MyKlassImpl();
+        mk.addProp( "foo" );
+
+        kieSession.insert( mk );
+        kieSession.insert( "Test Display" );
+        kieSession.fireAllRules();
+
+        TruthMaintenanceSystem tms = ( (NamedEntryPoint) kieSession.getEntryPoint( EntryPointId.DEFAULT.getEntryPointId() ) ).getTruthMaintenanceSystem();
+        assertEquals( 1, tms.getEqualityKeyMap().size() );
+
+        for ( Object o : kieSession.getObjects() ) {
+            if ( o instanceof IdentifiableEntity ) {
+                Collection<? extends Activity> acts = ProvenanceHelper.getProvenance( kieSession ).describeProvenance( o );
+                // creation, typing and setting of property "links"
+                assertEquals( 2, acts.size() );
+
+                Activity act = acts.iterator().next();
+                assertEquals( 1, act.getGenerated().size() );
+                assertEquals( 1, act.getUsed().size() );
+                Entity e = act.getUsed().iterator().next();
+                assertEquals( 2, e.getDisplaysAs().size() );
+                Narrative n = e.getDisplaysAs().get( 1 );
+                assertEquals( Arrays.asList( "foo" ), n.getNarrativeText() );
+            }
+        }
+    }
+
+    @Test
     public void testProvenanceNewWith() {
         List list = new ArrayList();
         KieSession kieSession = loadProvenanceSession("testTasks_newWith.drl", list );
