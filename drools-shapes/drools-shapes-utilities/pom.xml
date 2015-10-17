@@ -70,12 +70,6 @@
 		</repository>
 
 		<repository>
-			<id>jboss-snapshots-repository</id>
-			<name>JBoss Snapshot Repository</name>
-			<url>https://repository.jboss.org/nexus/content/repositories/snapshots/</url>
-		</repository>
-
-		<repository>
 			<id>EmpireRDF</id>
 			<url>https://github.com/EmpireRDF/mavenRepo/raw/master/releases</url>
 		</repository>
